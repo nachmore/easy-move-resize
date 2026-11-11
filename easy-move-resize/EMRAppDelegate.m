@@ -33,9 +33,12 @@ static void bringWindowToFront(AXUIElementRef window) {
     }
     AXUIElementPerformAction(window, kAXRaiseAction);
 }
+// If Accessibility is revoked while we're running, how long (in seconds) to wait for it to be re-granted before quitting
+static const CFTimeInterval kAccessibilityRegrantTimeout = 60;
 
 @implementation EMRAppDelegate {
     EMRPreferences *preferences;
+    CFTimeInterval accessibilityDeadline; // non-zero while waiting for Accessibility to be re-granted
 }
 
 - (id) init  {
@@ -82,6 +85,11 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
     EMRMoveResize* moveResize = [EMRMoveResize instance];
 
     if ((type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput)) {
+        if (!AXIsProcessTrusted()) {
+            // Accessibility was revoked: don't re-enable the tap, stop it and ask for the permission back
+            dispatch_async(dispatch_get_main_queue(), ^{ [ourDelegate checkAccessibility]; });
+            return event;
+        }
         // need to re-enable our eventTap (We got disabled.  Usually happens on a slow resizing app)
         CGEventTapEnable([moveResize eventTap], true);
         // we may have missed the mouse-up while disabled; don't let a held-back click linger
@@ -391,8 +399,39 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
     // Retrieve the Key press modifier flags to activate move/resize actions.
     keyModifierFlags = [preferences modifierFlags];
     
-    CFRunLoopSourceRef runLoopSource;
+    if (![self startEventTap]) {
+        NSLog(@"Couldn't create event tap!");
+        exit(1);
+    }
 
+    _sessionActive = true;
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+            addObserver:self
+            selector:@selector(becameActive:)
+            name:NSWorkspaceSessionDidBecomeActiveNotification
+            object:nil];
+
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+            addObserver:self
+            selector:@selector(becameInactive:)
+            name:NSWorkspaceSessionDidResignActiveNotification
+            object:nil];
+
+    // Watch for Accessibility being revoked while we're running (see checkAccessibility)
+    [[NSDistributedNotificationCenter defaultCenter]
+            addObserver:self
+            selector:@selector(accessibilityChanged:)
+            name:@"com.apple.accessibility.api"
+            object:nil
+            suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    NSTimer *accessibilityTimer = [NSTimer timerWithTimeInterval:2.0 target:self selector:@selector(checkAccessibility) userInfo:nil repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:accessibilityTimer forMode:NSRunLoopCommonModes];
+
+    [self reconstructDisabledAppsSubmenu];
+}
+
+// Create our event tap and start intercepting mouse events (unless we've been disabled from the menu)
+- (BOOL)startEventTap {
     CGEventMask eventMask = CGEventMaskBit( kCGEventLeftMouseDown )
                     | CGEventMaskBit( kCGEventRightMouseDown )
                     | CGEventMaskBit( kCGEventOtherMouseDown )
@@ -412,33 +451,67 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
                                               (__bridge void * _Nullable)self);
 
     if (!eventTap) {
-        NSLog(@"Couldn't create event tap!");
-        exit(1);
+        return NO;
     }
 
-    runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
-
+    CFRunLoopSourceRef runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
 
     EMRMoveResize *moveResize = [EMRMoveResize instance];
     [moveResize setEventTap:eventTap];
     [moveResize setRunLoopSource:runLoopSource];
-    [self enableRunLoopSource:moveResize];
     CFRelease(runLoopSource);
+    if ([_disabledMenu state] == 0) {
+        [self enableRunLoopSource:moveResize];
+    }
+    return YES;
+}
 
-    _sessionActive = true;
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-            addObserver:self
-            selector:@selector(becameActive:)
-            name:NSWorkspaceSessionDidBecomeActiveNotification
-            object:nil];
+// Stop intercepting events and throw our event tap away
+- (void)stopEventTap {
+    EMRMoveResize *moveResize = [EMRMoveResize instance];
+    CFMachPortRef eventTap = [moveResize eventTap];
+    if (eventTap == NULL) {
+        return;
+    }
+    [self disableRunLoopSource:moveResize];
+    CFMachPortInvalidate(eventTap);
+    CFRelease(eventTap);
+    [moveResize setEventTap:NULL];
+    [moveResize setRunLoopSource:NULL];
+    [moveResize setTracking:0];
+}
 
-    [[[NSWorkspace sharedWorkspace] notificationCenter]
-            addObserver:self
-            selector:@selector(becameInactive:)
-            name:NSWorkspaceSessionDidResignActiveNotification
-            object:nil];
-    
-    [self reconstructDisabledAppsSubmenu];
+- (void)accessibilityChanged:(NSNotification*) notification {
+    // the trust state is updated shortly after this notification is posted
+    [self performSelector:@selector(checkAccessibility) withObject:nil afterDelay:0.5];
+}
+
+// Called periodically, when the system's Accessibility list changes, and when our event tap gets disabled.
+// If Accessibility is revoked while we're running, an event tap we can no longer service makes clicks
+// misbehave system-wide, so stop intercepting events straight away, ask once for the permission back,
+// and quit if it isn't re-granted within kAccessibilityRegrantTimeout.
+- (void)checkAccessibility {
+    BOOL trusted = AXIsProcessTrusted();
+    if (accessibilityDeadline == 0) {
+        if (trusted) {
+            return;
+        }
+        NSLog(@"Accessibility permission lost, pausing");
+        [self stopEventTap];
+        accessibilityDeadline = CACurrentMediaTime() + kAccessibilityRegrantTimeout;
+        NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
+        AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+    } else if (trusted) {
+        NSLog(@"Accessibility permission restored, resuming");
+        accessibilityDeadline = 0;
+        if (![self startEventTap]) {
+            NSLog(@"Couldn't create event tap!");
+            [NSApp terminate:nil];
+        }
+    } else if (CACurrentMediaTime() > accessibilityDeadline) {
+        NSLog(@"Accessibility permission not restored, quitting");
+        [NSApp terminate:nil];
+    }
 }
 
 - (void)becameActive:(NSNotification*) notification {
@@ -459,11 +532,17 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 }
 
 - (void)enableRunLoopSource:(EMRMoveResize*)moveResize {
+    if ([moveResize eventTap] == NULL) {
+        return; // waiting for Accessibility to be re-granted
+    }
     CFRunLoopAddSource(CFRunLoopGetCurrent(), [moveResize runLoopSource], kCFRunLoopCommonModes);
     CGEventTapEnable([moveResize eventTap], true);
 }
 
 - (void)disableRunLoopSource:(EMRMoveResize*)moveResize {
+    if ([moveResize eventTap] == NULL) {
+        return;
+    }
     CGEventTapEnable([moveResize eventTap], false);
     CFRunLoopRemoveSource(CFRunLoopGetCurrent(), [moveResize runLoopSource], kCFRunLoopCommonModes);
 }

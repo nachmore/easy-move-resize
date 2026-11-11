@@ -10,6 +10,7 @@
 - (int)modifierFlags;
 
 - (void)initMenuItems;
+- (void)checkAccessibility;
 - (IBAction)modifierToggle:(id)sender;
 - (IBAction)resetToDefaults:(id)sender;
 - (IBAction)toggleDisabled:(id)sender;
