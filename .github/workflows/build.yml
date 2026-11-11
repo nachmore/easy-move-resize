@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build unsigned .app (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build .app (unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild \
+            -project easy-move-resize.xcodeproj \
+            -scheme easy-move-resize \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build
+          mkdir -p artifact
+          ditto -c -k --keepParent "build/Build/Products/Release/Easy Move+Resize.app" "artifact/Easy Move+Resize.unsigned.zip"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: easy-move-resize-unsigned
+          path: artifact/Easy Move+Resize.unsigned.zip
+          if-no-files-found: error
+          retention-days: 7
