@@ -38,7 +38,7 @@ static const CFTimeInterval kAccessibilityRegrantTimeout = 60;
 
 @implementation EMRAppDelegate {
     EMRPreferences *preferences;
-    CFTimeInterval accessibilityDeadline; // non-zero while waiting for Accessibility to be re-granted
+    BOOL waitingForAccessibility; // Accessibility was revoked; waiting for it to be re-granted
 }
 
 - (id) init  {
@@ -148,7 +148,15 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 
         AXUIElementRef _element;
         bool overMenuBar = NO;
-        if ((AXUIElementCopyElementAtPosition(_systemWideElement, (float) mouseLocation.x, (float) mouseLocation.y, &_element) == kAXErrorSuccess) && _element) {
+        AXError lookupError = AXUIElementCopyElementAtPosition(_systemWideElement, (float) mouseLocation.x, (float) mouseLocation.y, &_element);
+        if (lookupError == kAXErrorAPIDisabled) {
+            // Accessibility was revoked: stop intercepting events and ask for the permission back
+            CFRelease(_systemWideElement);
+            [moveResize setTracking:0];
+            dispatch_async(dispatch_get_main_queue(), ^{ [ourDelegate checkAccessibility]; });
+            return event;
+        }
+        if ((lookupError == kAXErrorSuccess) && _element) {
             CFTypeRef _role;
             if (AXUIElementCopyAttributeValue(_element, (__bridge CFStringRef)NSAccessibilityRoleAttribute, &_role) == kAXErrorSuccess) {
                 NSString *role = (__bridge NSString *)_role;
@@ -417,16 +425,13 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
             name:NSWorkspaceSessionDidResignActiveNotification
             object:nil];
 
-    // Watch for Accessibility being revoked while we're running (see checkAccessibility)
+    // Watch for Accessibility being revoked/re-granted while we're running (see checkAccessibility)
     [[NSDistributedNotificationCenter defaultCenter]
             addObserver:self
             selector:@selector(accessibilityChanged:)
             name:@"com.apple.accessibility.api"
             object:nil
             suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
-    NSTimer *accessibilityTimer = [NSTimer timerWithTimeInterval:2.0 target:self selector:@selector(checkAccessibility) userInfo:nil repeats:YES];
-    accessibilityTimer.tolerance = 0.5;
-    [[NSRunLoop mainRunLoop] addTimer:accessibilityTimer forMode:NSRunLoopCommonModes];
 
     [self reconstructDisabledAppsSubmenu];
 }
@@ -489,25 +494,33 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
     [self performSelector:@selector(checkAccessibility) withObject:nil afterDelay:0.5 inModes:@[NSRunLoopCommonModes]];
 }
 
-// Called periodically, when the system's Accessibility list changes, and when our event tap gets disabled.
-// If Accessibility is revoked while we're running, an event tap we can no longer service makes clicks
-// misbehave system-wide, so stop intercepting events straight away, ask once for the permission back,
-// and quit if it isn't re-granted within kAccessibilityRegrantTimeout.
+// Called when the system's Accessibility list changes, when our event tap gets disabled, and when an
+// Accessibility call fails because we're no longer trusted. If Accessibility is revoked while we're running,
+// an event tap we can no longer service makes clicks misbehave system-wide, so stop intercepting events
+// straight away, ask once for the permission back, and quit if it isn't re-granted within
+// kAccessibilityRegrantTimeout.
 - (void)checkAccessibility {
     BOOL trusted = AXIsProcessTrusted();
-    if (accessibilityDeadline == 0) {
+    if (!waitingForAccessibility) {
         if (trusted) {
             return;
         }
         NSLog(@"Accessibility permission lost, pausing");
         [self stopEventTap];
-        accessibilityDeadline = CACurrentMediaTime() + kAccessibilityRegrantTimeout;
+        waitingForAccessibility = YES;
         NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+        [self performSelector:@selector(accessibilityRegrantTimedOut) withObject:nil afterDelay:kAccessibilityRegrantTimeout inModes:@[NSRunLoopCommonModes]];
     } else if (trusted && [self startEventTap]) {
         NSLog(@"Accessibility permission restored, resuming");
-        accessibilityDeadline = 0;
-    } else if (CACurrentMediaTime() > accessibilityDeadline) {
+        waitingForAccessibility = NO;
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(accessibilityRegrantTimedOut) object:nil];
+    }
+}
+
+- (void)accessibilityRegrantTimedOut {
+    [self checkAccessibility]; // last chance, in case the re-grant notification was missed
+    if (waitingForAccessibility) {
         NSLog(@"Accessibility permission not restored, quitting");
         [NSApp terminate:nil];
     }
