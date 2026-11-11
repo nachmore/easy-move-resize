@@ -425,6 +425,7 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
             object:nil
             suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
     NSTimer *accessibilityTimer = [NSTimer timerWithTimeInterval:2.0 target:self selector:@selector(checkAccessibility) userInfo:nil repeats:YES];
+    accessibilityTimer.tolerance = 0.5;
     [[NSRunLoop mainRunLoop] addTimer:accessibilityTimer forMode:NSRunLoopCommonModes];
 
     [self reconstructDisabledAppsSubmenu];
@@ -462,6 +463,8 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
     CFRelease(runLoopSource);
     if ([_disabledMenu state] == 0) {
         [self enableRunLoopSource:moveResize];
+    } else {
+        CGEventTapEnable(eventTap, false); // taps start enabled; stay off while disabled from the menu
     }
     return YES;
 }
@@ -483,7 +486,7 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
 
 - (void)accessibilityChanged:(NSNotification*) notification {
     // the trust state is updated shortly after this notification is posted
-    [self performSelector:@selector(checkAccessibility) withObject:nil afterDelay:0.5];
+    [self performSelector:@selector(checkAccessibility) withObject:nil afterDelay:0.5 inModes:@[NSRunLoopCommonModes]];
 }
 
 // Called periodically, when the system's Accessibility list changes, and when our event tap gets disabled.
@@ -501,13 +504,9 @@ CGEventRef myCGEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef
         accessibilityDeadline = CACurrentMediaTime() + kAccessibilityRegrantTimeout;
         NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
-    } else if (trusted) {
+    } else if (trusted && [self startEventTap]) {
         NSLog(@"Accessibility permission restored, resuming");
         accessibilityDeadline = 0;
-        if (![self startEventTap]) {
-            NSLog(@"Couldn't create event tap!");
-            [NSApp terminate:nil];
-        }
     } else if (CACurrentMediaTime() > accessibilityDeadline) {
         NSLog(@"Accessibility permission not restored, quitting");
         [NSApp terminate:nil];
